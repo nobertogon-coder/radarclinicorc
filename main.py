@@ -18,19 +18,13 @@ app = FastAPI(title="Radar Clínico", description="Sistema de Apoio à Decisão 
 # ==============================================================================
 @app.on_event("startup")
 def verificar_base_dados():
+    print("Iniciando verificação da base de dados no arranque...")
+    import setup_db
     try:
-        conn = sqlite3.connect("radar_clinico.db")
-        cursor = conn.cursor()
-        cursor.execute("SELECT 1 FROM usuarios")
-        cursor.execute("SELECT dose_max_padrao_mg FROM antimicrobianos")
-        conn.close()
-    except sqlite3.OperationalError:
-        print("Base de dados desatualizada. A executar setup_db.py automaticamente...")
-        try:
-            import setup_db
-            setup_db.setup_database()
-        except Exception as e:
-            print("Erro ao forçar a base de dados:", e)
+        setup_db.setup_database()
+        print("Base de dados gerada/atualizada com sucesso no arranque.")
+    except Exception as e:
+        print(f"Erro crítico ao forçar a base de dados no arranque: {e}")
 
 if os.path.isdir("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
