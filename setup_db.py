@@ -9,7 +9,7 @@ def setup_database():
     conn = sqlite3.connect("radar_clinico.db")
     cursor = conn.cursor()
     
-    # 1. Usuários (AGORA COM AS NOVAS CREDENCIAIS: Noberto / admin123)
+    # 1. Usuários (Credenciais: Noberto / admin123)
     cursor.execute("CREATE TABLE IF NOT EXISTS usuarios (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, password TEXT NOT NULL, role TEXT NOT NULL)")
     cursor.execute("INSERT OR IGNORE INTO usuarios (username, password, role) VALUES ('Noberto', 'admin123', 'admin')")
 
