@@ -1,6 +1,7 @@
 import sqlite3
 import re
 import os
+import unicodedata
 from typing import List, Optional
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import HTMLResponse
@@ -13,12 +14,42 @@ import uvicorn
 
 app = FastAPI(title="Radar Clínico", description="Sistema de Apoio à Decisão Farmacêutica")
 
+# ==============================================================================
+# INICIALIZAÇÃO AUTOMÁTICA DA BASE DE DADOS
+# ==============================================================================
+def garantir_banco():
+    precisa_recriar = False
+    if not os.path.exists("radar_clinico.db"):
+        precisa_recriar = True
+    else:
+        try:
+            conn = sqlite3.connect("radar_clinico.db")
+            cursor = conn.cursor()
+            cursor.execute("SELECT diluente_padrao FROM antimicrobianos LIMIT 1")
+            cursor.execute("SELECT 1 FROM antimicrobianos WHERE nome_generico = 'Cefazolina'")
+            if not cursor.fetchone():
+                precisa_recriar = True
+            conn.close()
+        except Exception:
+            precisa_recriar = True
+
+    if precisa_recriar:
+        import setup_db
+        setup_db.setup_database()
+
+garantir_banco()
+
 if os.path.isdir("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # ==============================================================================
-# LÓGICA CLÍNICA
+# FUNÇÕES UTILITÁRIAS E DE PROCESSAMENTO DE TEXTO (PLN)
 # ==============================================================================
+def sem_acentos(texto: str) -> str:
+    if not texto:
+        return ""
+    return "".join(c for c in unicodedata.normalize("NFD", texto) if unicodedata.category(c) != "Mn")
+
 def calcular_metricas(sexo: str, idade: int, peso_atual: float, altura_cm: float, creatinina: float):
     alt_m = altura_cm / 100.0
     imc = peso_atual / (alt_m ** 2) if alt_m > 0 else 0
@@ -41,13 +72,75 @@ def calcular_metricas(sexo: str, idade: int, peso_atual: float, altura_cm: float
     else:
         clcr = 0.0
 
-    return {"imc": round(imc, 1), "peso_ideal": round(peso_ideal, 1), "peso_adotado": round(peso_adotado, 1), "clcr": round(clcr, 1)}
+    return {
+        "imc": round(imc, 1),
+        "peso_ideal": round(peso_ideal, 1),
+        "peso_adotado": round(peso_adotado, 1),
+        "clcr": round(clcr, 1)
+    }
 
 def limpar_texto_prescricao(texto: str) -> str:
     texto = re.sub(r'\d{3}\.?\d{3}\.?\d{3}-?\d{2}', '[CPF OCULTO]', texto)
-    texto = re.sub(r'(Prontuário|Registro|Atendimento|RG)[\s:]*([0-9A-Za-z\.\-]+)', r' : [RESTRITO]', texto, flags=re.IGNORECASE)
-    texto = re.sub(r'(Paciente|Nome)[\s:]+([A-ZÀ-Úa-zà-ú\s]{4,40})', r' : [PACIENTE - LGPD]', texto, flags=re.IGNORECASE)
+    texto = re.sub(r'(Prontuário|Prontuario|Registro|Atendimento|RG)[\s:]*([0-9A-Za-z\.\-]+)', r'\1: [RESTRITO]', texto, flags=re.IGNORECASE)
+    texto = re.sub(r'(Paciente|Nome)[\s:]+([A-ZÀ-Úa-zà-ú\s]{4,40})', r'\1: [PACIENTE - LGPD]', texto, flags=re.IGNORECASE)
     return texto
+
+def extrair_detalhes_linha(bloco_texto: str):
+    """Extrai posologia, dia de tratamento (D) e diluente/via de um bloco de prescrição."""
+    bloco_limpo = " ".join(bloco_texto.split())
+    
+    # 1. Dia de tratamento (Ex: D1, D4, D10, 3º dia, D 5)
+    dia = ""
+    m_dia = re.search(r'\b[dD]\s*[-:]?\s*(\d{1,2})(?:/\d{1,2})?\b', bloco_limpo)
+    if m_dia:
+        dia = f"D{m_dia.group(1)}"
+    else:
+        m_dia2 = re.search(r'(\d{1,2})\s*[ºo°]?\s*dia\b', bloco_limpo, re.IGNORECASE)
+        if m_dia2:
+            dia = f"D{m_dia2.group(1)}"
+
+    # 2. Posologia (Dose + Frequência)
+    dose_str = ""
+    # Procura doses como 1g, 1.000mg, 500 mg, 500.000 UI, 4,5g
+    m_dose = re.search(r'(\d+(?:[\.,]\d+)?\s*(?:mg|g|ui|mcg))', bloco_limpo, re.IGNORECASE)
+    if m_dose:
+        dose_str = m_dose.group(1).replace(" ", "")
+
+    freq_str = ""
+    m_freq = re.search(r'(\b(?:6/6h?|8/8h?|12/12h?|24/24h?|48/48h?|1x\s*ao\s*dia|2x\s*ao\s*dia|3x\s*ao\s*dia|4x\s*ao\s*dia|a\s*cada\s*\d+\s*h(?:oras)?|de\s*\d+/\d+\s*h?|\b\d{1,2}h\b))', bloco_limpo, re.IGNORECASE)
+    if m_freq:
+        freq_str = m_freq.group(1)
+
+    posologia = f"{dose_str} {freq_str}".strip()
+
+    # 3. Diluente e Via
+    diluentes_achados = []
+    padroes_diluente = [
+        (r'\b(?:sf|soro\s*fisiologico)\s*(?:0[,\.]9\s*%?)?\s*(?:\d+\s*ml)?', 'SF 0,9%'),
+        (r'\b(?:sg|soro\s*glicosado|glicose)\s*(?:5\s*%?)?\s*(?:\d+\s*ml)?', 'SG 5%'),
+        (r'\b(?:ad|abd|agua\s*destilada|agua\s*p/?\s*inj(?:ecao|etaveis)?)\s*(?:\d+\s*ml)?', 'Água Destilada (AD)'),
+        (r'\b(?:rl|ringer\s*(?:lactato)?)\s*(?:\d+\s*ml)?', 'Ringer Lactato')
+    ]
+    bloco_sem_acento = sem_acentos(bloco_limpo.lower())
+    for regex_padrao, nome_padrao in padroes_diluente:
+        m_dil = re.search(regex_padrao, bloco_sem_acento, re.IGNORECASE)
+        if m_dil:
+            # Tenta capturar o volume próximo (ex: 100ml, 50 ml, 250ml)
+            m_vol = re.search(r'(\d{2,3}\s*ml)', m_dil.group(0), re.IGNORECASE)
+            if not m_vol:
+                m_vol = re.search(r'(\d{2,3}\s*ml)', bloco_sem_acento, re.IGNORECASE)
+            vol_txt = f" {m_vol.group(1).upper()}" if m_vol else ""
+            diluentes_achados.append(f"{nome_padrao}{vol_txt}")
+
+    # Captura Via (EV, IV, IM, VO, SNE)
+    m_via = re.search(r'\b(EV|IV|IM|VO|SNE|SNG|SC|endovenoso|intravenoso)\b', bloco_limpo, re.IGNORECASE)
+    via_str = m_via.group(1).upper() if m_via else ""
+
+    diluente_final = " + ".join(dict.fromkeys(diluentes_achados))
+    if via_str and via_str not in diluente_final:
+        diluente_final = f"{via_str} | {diluente_final}" if diluente_final else via_str
+
+    return {"dia": dia, "poso": posologia, "diluente": diluente_final}
 
 # ==============================================================================
 # INTERFACE HTML
@@ -95,28 +188,28 @@ HTML_TEMPLATE = """
         .btn-sair { background-color: #dc3545; color: white; border: none; border-radius: 6px; padding: 8px 16px; font-size: 0.85rem; font-weight: 700; }
         .btn-sair:hover { background-color: #bb2d3b; color: white; }
 
-        .form-label-custom { font-size: 0.75rem; font-weight: 700; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 0.2rem; }
-        .form-control-custom { border-radius: 8px; border: 1px solid #d1d5db; padding: 8px 12px; font-size: 0.9rem; }
+        .form-label-custom { font-size: 0.72rem; font-weight: 700; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 0.2rem; display: block; }
+        .form-control-custom { border-radius: 8px; border: 1px solid #d1d5db; padding: 8px 12px; font-size: 0.88rem; }
         .btn-brand { background-color: var(--brand-primary); color: white; border: none; border-radius: 8px; font-weight: 600; padding: 10px 15px; }
         .btn-brand:hover { background-color: var(--brand-dark); color: white; }
         .card-dash { border: none; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); margin-bottom: 20px; background: white; border-top: 4px solid var(--brand-primary); }
         .card-title-dash { font-size: 0.9rem; font-weight: 700; color: var(--brand-primary); text-transform: uppercase; margin-bottom: 1rem; display: flex; align-items: center; }
-        .step-number { background: var(--brand-light); color: var(--brand-primary); width: 24px; height: 24px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 0.8rem; margin-right: 10px; flex-shrink: 0; }
+        .step-number { background: var(--brand-light); color: var(--brand-primary); width: 24px; height: 24px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 0.8rem; margin-right: 10px; flex-shrink: 0; font-weight: 800; }
         .metric-box { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 15px; text-align: center; height: 100%; display: flex; flex-direction: column; justify-content: center; }
         .metric-value { font-size: 1.8rem; font-weight: 800; color: var(--brand-primary); margin: 5px 0; }
-        .soap-output { font-family: 'Consolas', monospace; font-size: 0.9rem; border: 1px solid #e2e8f0; border-radius: 8px; background: #f8fafc; padding: 15px; width: 100%; min-height: 400px; resize: vertical; }
+        .soap-output { font-family: 'Consolas', monospace; font-size: 0.88rem; border: 1px solid #e2e8f0; border-radius: 8px; background: #f8fafc; padding: 15px; width: 100%; min-height: 480px; resize: vertical; }
         .d-none { display: none !important; }
         
-        .slot-container { background: white; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px; margin-bottom: 10px; }
-        .slot-row { display: flex; gap: 8px; align-items: center; margin-bottom: 5px; }
-        .slot-row > select { flex: 2; }
-        .slot-row > input { flex: 1; }
+        .slot-container { background: white; border: 1px solid #cbd5e1; border-radius: 8px; padding: 10px; margin-bottom: 10px; border-left: 4px solid var(--brand-primary); }
+        .slot-row { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+        .slot-row > select { flex: 3; }
+        .slot-row > input.dia-input { flex: 1; max-width: 90px; }
 
         .select2-container--default .select2-selection--multiple {
             border: 1px solid #d1d5db;
             border-radius: 8px;
-            min-height: 42px;
-            padding: 2px 8px;
+            min-height: 40px;
+            padding: 2px 6px;
         }
         .select2-container--default .select2-selection--multiple .select2-selection__choice {
             background-color: var(--brand-light);
@@ -124,23 +217,14 @@ HTML_TEMPLATE = """
             color: var(--brand-dark);
             border-radius: 6px;
             padding: 2px 8px;
-            font-size: 0.85rem;
+            font-size: 0.8rem;
             font-weight: 600;
-        }
-        .select2-container--default .select2-selection--multiple .select2-selection__choice__remove {
-            color: var(--brand-dark);
-            margin-right: 5px;
-            border-right: 1px solid #bae6fd;
-        }
-        .select2-container--default .select2-selection--multiple .select2-selection__choice__remove:hover {
-            background-color: #bae6fd;
-            color: var(--brand-dark);
         }
         .tag-btn {
             display: inline-block;
             padding: 4px 10px;
             margin: 2px;
-            font-size: 0.8rem;
+            font-size: 0.78rem;
             font-weight: 600;
             color: #4b5563;
             background-color: #f3f4f6;
@@ -156,12 +240,12 @@ HTML_TEMPLATE = """
             color: white;
             border: none;
             border-radius: 8px;
-            font-weight: 600;
-            padding: 12px;
+            font-weight: 700;
+            padding: 11px;
             width: 100%;
             text-transform: uppercase;
             letter-spacing: 0.5px;
-            transition: background-color 0.2s;
+            font-size: 0.85rem;
         }
         .btn-extrair:hover { background-color: #0f172a; color: white; }
 
@@ -170,16 +254,16 @@ HTML_TEMPLATE = """
             background-color: #dcfce7;
             color: #166534;
             display: inline-block;
-            padding: 8px 16px;
+            padding: 7px 14px;
             cursor: pointer;
             border-radius: 20px;
             font-weight: 700;
-            font-size: 0.85rem;
-            transition: all 0.2s;
+            font-size: 0.82rem;
+            white-space: nowrap;
         }
         .custom-file-upload:hover { background-color: #bbf7d0; }
         input[type="file"] { display: none; }
-        .file-name-display { font-size: 0.85rem; color: #6b7280; margin-left: 10px; }
+        .file-name-display { font-size: 0.82rem; color: #6b7280; margin-left: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     </style>
 </head>
 <body>
@@ -225,13 +309,13 @@ HTML_TEMPLATE = """
 
     <div class="container-fluid p-4" style="max-width: 1400px;">
         <div class="row g-4">
-            <!-- Bloco 1 -->
-            <div class="col-lg-3">
+            <!-- Bloco 1: Perfil & Risco -->
+            <div class="col-lg-4">
                 <div class="card card-dash p-3 h-100">
                     <div class="card-title-dash"><span class="step-number">1</span> Perfil & Risco</div>
                     <div class="row g-2">
-                        <div class="col-6"><label class="form-label-custom">Idade</label><input type="number" id="idade" class="form-control form-control-custom" value="65"></div>
-                        <div class="col-6"><label class="form-label-custom">Sexo</label><select id="sexo" class="form-select form-control-custom"><option value="m">Masc</option><option value="f">Fem</option></select></div>
+                        <div class="col-6"><label class="form-label-custom">Idade (Anos)</label><input type="number" id="idade" class="form-control form-control-custom" value="65"></div>
+                        <div class="col-6"><label class="form-label-custom">Sexo Biológico</label><select id="sexo" class="form-select form-control-custom"><option value="m">Masculino</option><option value="f">Feminino</option></select></div>
                     </div>
                     
                     <label class="form-label-custom mt-3">Comorbidades Clássicas</label>
@@ -254,19 +338,20 @@ HTML_TEMPLATE = """
                         <span class="tag-btn" onclick="addComorbidade('Demência')">+ Demência</span>
                         <span class="tag-btn" onclick="addComorbidade('Parkinson')">+ Parkinson</span>
                         <span class="tag-btn" onclick="addComorbidade('DPOC')">+ DPOC</span>
+                        <span class="tag-btn" onclick="addComorbidade('Hepatopatia')">+ Hepatopatia</span>
                         <span class="tag-btn" onclick="addComorbidade('Acamado')">+ Acamado</span>
                     </div>
                 </div>
             </div>
 
-            <!-- Bloco 2 -->
-            <div class="col-lg-3">
+            <!-- Bloco 2: Função Renal & Antropometria -->
+            <div class="col-lg-4">
                 <div class="card card-dash p-3 h-100">
-                    <div class="card-title-dash"><span class="step-number">2</span> Antropometria</div>
+                    <div class="card-title-dash"><span class="step-number">2</span> Função Renal & Antropometria</div>
                     <div class="row g-2 mb-3">
-                        <div class="col-4"><label class="form-label-custom">Cr (mg/dL)</label><input type="number" step="0.1" id="creatinina" class="form-control form-control-custom" value="1.2"></div>
+                        <div class="col-4"><label class="form-label-custom">Creat. (mg/dL)</label><input type="number" step="0.1" id="creatinina" class="form-control form-control-custom" value="1.2"></div>
                         <div class="col-4"><label class="form-label-custom">Peso (kg)</label><input type="number" id="peso" class="form-control form-control-custom" value="70"></div>
-                        <div class="col-4"><label class="form-label-custom">Alt (cm)</label><input type="number" id="altura" class="form-control form-control-custom" value="170"></div>
+                        <div class="col-4"><label class="form-label-custom">Altura (cm)</label><input type="number" id="altura" class="form-control form-control-custom" value="170"></div>
                     </div>
                     <div class="metric-box">
                         <div class="form-label-custom text-muted" style="font-size: 0.65rem;">DEPURAÇÃO ESTIMADA (COCKCROFT-GAULT)</div>
@@ -276,77 +361,116 @@ HTML_TEMPLATE = """
                 </div>
             </div>
 
-            <!-- Bloco 3: ENTRADA DA PRESCRIÇÃO -->
-            <div class="col-lg-3">
+            <!-- Bloco 3: Entrada da Prescrição -->
+            <div class="col-lg-4">
                 <div class="card card-dash p-3 h-100">
-                    <div class="card-title-dash" style="color: #198754;"><span class="step-number" style="background-color: #d1e7dd; color: #198754;">3</span> Entrada da Prescrição</div>
+                    <div class="card-title-dash"><span class="step-number">3</span> Entrada da Prescrição</div>
                     
                     <label class="form-label-custom text-muted">Prescrição em PDF</label>
-                    <div class="mb-3 d-flex align-items-center">
+                    <div class="mb-2 d-flex align-items-center">
                         <label class="custom-file-upload">
                             <input type="file" id="pdfFile" accept=".pdf" onchange="updateFileName(this)">
                             Escolher arquivo
                         </label>
-                        <span id="fileNameDisplay" class="file-name-display">Nenhum ar...o escolhido</span>
+                        <span id="fileNameDisplay" class="file-name-display">Nenhum arquivo escolhido</span>
                     </div>
 
-                    <label class="form-label-custom text-muted">Ou cole a prescrição</label>
-                    <textarea id="textoBruto" class="form-control form-control-custom mb-3" rows="4" placeholder="Cole o texto da prescrição aqui..."></textarea>
+                    <label class="form-label-custom text-muted mt-1">Ou cole a prescrição (Opcional)</label>
+                    <textarea id="textoManual" class="form-control form-control-custom mb-2" rows="3" placeholder="Cole o texto da prescrição aqui se necessário..."></textarea>
+                    <input type="hidden" id="textoBrutoOculto">
                     
-                    <button class="btn-extrair" type="button" onclick="extrairPdf()"><i class="bi bi-magic me-2"></i> Extrair Prescrição</button>
-                </div>
-            </div>
-
-            <!-- NOVO BLOCO 4: OUTROS MEDICAMENTOS ISOLADOS -->
-            <div class="col-lg-3">
-                <div class="card card-dash p-3 h-100">
-                    <div class="card-title-dash" style="color: #6f42c1;"><span class="step-number" style="background-color: #e0cffc; color: #6f42c1;">4</span> Outros Medicamentos Isolados</div>
-                    <p class="text-muted small mb-2" style="font-size: 0.75rem;">O sistema separará e listará aqui os fármacos contínuos encontrados na prescrição, excluindo os antimicrobianos.</p>
-                    <textarea id="outrosMedicamentos" class="form-control form-control-custom h-100 border-0 bg-light" style="resize: none;" placeholder="Aguardando extração..."></textarea>
+                    <button class="btn-extrair mt-auto" type="button" onclick="extrairPdf()"><i class="bi bi-magic me-2"></i> Extrair Prescrição</button>
+                    <div id="statusExtracao" class="small fw-bold text-success mt-1 d-none"></div>
                 </div>
             </div>
             
-            <!-- Bloco 5: AVALIACAO -->
+            <!-- Bloco 4: Terapêutica Antimicrobiana & Avaliação Clínica SOAP -->
             <div class="col-12">
                 <div class="card card-dash p-3">
                     <div class="d-flex justify-content-between align-items-center mb-3">
-                        <div class="card-title-dash mb-0"><span class="step-number">5</span> Terapêutica Antimicrobiana & Avaliação Clínica</div>
-                        <button class="btn btn-brand px-4 py-2 fs-6" onclick="gerarAnalise()"><i class="bi bi-robot me-2"></i> GERAR PARECER CLÍNICO</button>
+                        <div class="card-title-dash mb-0"><span class="step-number">4</span> Terapêutica Antimicrobiana & Avaliação Clínica SOAP</div>
+                        <button class="btn btn-brand px-4 py-2 fs-6" onclick="gerarAnalise()"><i class="bi bi-play-fill me-1"></i> AVALIAR PRESCRIÇÃO</button>
                     </div>
                     <div class="row g-4">
                         <div class="col-lg-5">
                             <div class="bg-light p-3 rounded border">
-                                <label class="form-label-custom mb-3">Antimicrobianos Detectados (Para Julgamento Posológico)</label>
+                                <label class="form-label-custom mb-2 text-primary">Antimicrobianos (Fármaco, Dia, Posologia e Diluente)</label>
                                 
-                                <div class="slot-container" id="containerSlot1">
+                                <!-- SLOT 1 -->
+                                <div class="slot-container">
                                     <div class="slot-row">
                                         <select id="slot1" class="form-select form-control-custom form-select-sm"><option value="">-- Antimicrobiano 1 --</option></select>
-                                        <input type="text" id="slot1_d" class="form-control form-control-custom form-control-sm" placeholder="Dia (Ex: D4)">
+                                        <input type="text" id="slot1_d" class="form-control form-control-custom form-control-sm dia-input" placeholder="Dia (D1)">
                                     </div>
-                                    <input type="text" id="slot1_poso" class="form-control form-control-custom form-control-sm mt-1" placeholder="Posologia p/ Julgamento (Ex: 1000mg a cada 12h)">
+                                    <div class="row g-1">
+                                        <div class="col-6">
+                                            <input type="text" id="slot1_poso" class="form-control form-control-custom form-control-sm" placeholder="Posologia (Ex: 1g 8/8h)">
+                                        </div>
+                                        <div class="col-6">
+                                            <input type="text" id="slot1_dil" class="form-control form-control-custom form-control-sm" placeholder="Diluente (Ex: SF 0,9% 100mL)">
+                                        </div>
+                                    </div>
                                 </div>
 
-                                <div class="slot-container" id="containerSlot2">
+                                <!-- SLOT 2 -->
+                                <div class="slot-container">
                                     <div class="slot-row">
                                         <select id="slot2" class="form-select form-control-custom form-select-sm"><option value="">-- Antimicrobiano 2 --</option></select>
-                                        <input type="text" id="slot2_d" class="form-control form-control-custom form-control-sm" placeholder="Dia (Ex: D4)">
+                                        <input type="text" id="slot2_d" class="form-control form-control-custom form-control-sm dia-input" placeholder="Dia (D1)">
                                     </div>
-                                    <input type="text" id="slot2_poso" class="form-control form-control-custom form-control-sm mt-1" placeholder="Posologia p/ Julgamento (Ex: 1000mg a cada 12h)">
+                                    <div class="row g-1">
+                                        <div class="col-6">
+                                            <input type="text" id="slot2_poso" class="form-control form-control-custom form-control-sm" placeholder="Posologia (Ex: 1g 12/12h)">
+                                        </div>
+                                        <div class="col-6">
+                                            <input type="text" id="slot2_dil" class="form-control form-control-custom form-control-sm" placeholder="Diluente (Ex: SF 0,9% 250mL)">
+                                        </div>
+                                    </div>
                                 </div>
                                 
-                                <div class="slot-container" id="containerSlot3">
+                                <!-- SLOT 3 -->
+                                <div class="slot-container">
                                     <div class="slot-row">
                                         <select id="slot3" class="form-select form-control-custom form-select-sm"><option value="">-- Antimicrobiano 3 --</option></select>
-                                        <input type="text" id="slot3_d" class="form-control form-control-custom form-control-sm" placeholder="Dia (Ex: D4)">
+                                        <input type="text" id="slot3_d" class="form-control form-control-custom form-control-sm dia-input" placeholder="Dia (D1)">
                                     </div>
-                                    <input type="text" id="slot3_poso" class="form-control form-control-custom form-control-sm mt-1" placeholder="Posologia p/ Julgamento (Ex: 1000mg a cada 12h)">
+                                    <div class="row g-1">
+                                        <div class="col-6">
+                                            <input type="text" id="slot3_poso" class="form-control form-control-custom form-control-sm" placeholder="Posologia (Ex: 2g 8/8h)">
+                                        </div>
+                                        <div class="col-6">
+                                            <input type="text" id="slot3_dil" class="form-control form-control-custom form-control-sm" placeholder="Diluente (Ex: SG 5% 100mL)">
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- SLOT 4 -->
+                                <div class="slot-container">
+                                    <div class="slot-row">
+                                        <select id="slot4" class="form-select form-control-custom form-select-sm"><option value="">-- Antimicrobiano 4 --</option></select>
+                                        <input type="text" id="slot4_d" class="form-control form-control-custom form-control-sm dia-input" placeholder="Dia (D1)">
+                                    </div>
+                                    <div class="row g-1">
+                                        <div class="col-6">
+                                            <input type="text" id="slot4_poso" class="form-control form-control-custom form-control-sm" placeholder="Posologia (Ex: 500mg 8/8h)">
+                                        </div>
+                                        <div class="col-6">
+                                            <input type="text" id="slot4_dil" class="form-control form-control-custom form-control-sm" placeholder="Diluente (Ex: Bolsa Pronta)">
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Demais Medicamentos Extraídos (Integrado sem criar Bloco 4 separado) -->
+                                <div class="mt-3 pt-2 border-top">
+                                    <label class="form-label-custom text-secondary"><i class="bi bi-capsule me-1"></i> Demais Medicamentos da Prescrição (Auto-Extraídos)</label>
+                                    <textarea id="outrosMedicamentos" class="form-control form-control-custom" rows="2" placeholder="Dipirona, Enoxaparina, Omeprazol, etc. aparecerão aqui automaticamente ao extrair o PDF..."></textarea>
                                 </div>
                             </div>
                         </div>
                         
                         <div class="col-lg-7 position-relative">
                             <button class="btn btn-sm btn-outline-secondary position-absolute top-0 end-0 m-2 fw-bold" style="z-index: 10;" onclick="copiarSoap()"><i class="bi bi-copy"></i> Copiar SOAP</button>
-                            <textarea id="parecerSoap" class="soap-output pt-5" readonly placeholder="Aguardando dados clínicos para gerar o parecer estruturado e o julgamento posológico..."></textarea>
+                            <textarea id="parecerSoap" class="soap-output pt-5" readonly placeholder="Aguardando dados clínicos para gerar o parecer estruturado, julgamento posológico e checagem de diluentes..."></textarea>
                         </div>
                     </div>
                 </div>
@@ -378,7 +502,7 @@ HTML_TEMPLATE = """
 <script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
 <script>
 $(document).ready(function() {
-    $('#comorbidadesSelect').select2({ placeholder: "Selecione ou digite...", allowClear: true });
+    $('#comorbidadesSelect').select2({ placeholder: "Selecione ou digite...", allowClear: true, width: '100%' });
 });
 
 function addComorbidade(tag) {
@@ -394,9 +518,9 @@ function updateFileName(input) {
     const display = document.getElementById('fileNameDisplay');
     if (input.files && input.files.length > 0) {
         let name = input.files[0].name;
-        display.innerText = name.length > 20 ? name.substring(0, 10) + '...' + name.substring(name.length - 7) : name;
+        display.innerText = name.length > 25 ? name.substring(0, 12) + '...' + name.substring(name.length - 8) : name;
     } else {
-        display.innerText = "Nenhum ar...o escolhido";
+        display.innerText = "Nenhum arquivo escolhido";
     }
 }
 
@@ -429,20 +553,23 @@ function novaTriagem() {
     $('#comorbidadesSelect').val(null).trigger('change');
     
     document.getElementById('pdfFile').value = ''; 
-    document.getElementById('fileNameDisplay').innerText = "Nenhum ar...o escolhido";
-    document.getElementById('textoBruto').value = '';
+    document.getElementById('fileNameDisplay').innerText = "Nenhum arquivo escolhido";
+    document.getElementById('textoManual').value = '';
+    document.getElementById('textoBrutoOculto').value = '';
     document.getElementById('outrosMedicamentos').value = ''; 
     document.getElementById('parecerSoap').value = '';
+    document.getElementById('statusExtracao').classList.add('d-none');
     
     document.getElementById('valClcr').innerHTML = '-- <span style="font-size:1rem;">mL/min</span>';
     document.getElementById('navClcr').innerText = '-- mL/min';
     document.getElementById('navAlertas').innerText = '0';
     document.getElementById('valPesoAdotado').innerText = '--';
     
-    ['slot1', 'slot2', 'slot3'].forEach(id => {
+    ['slot1', 'slot2', 'slot3', 'slot4'].forEach(id => {
         document.getElementById(id).value = '';
         document.getElementById(id+'_d').value = '';
         document.getElementById(id+'_poso').value = '';
+        document.getElementById(id+'_dil').value = '';
     });
 }
 
@@ -462,60 +589,81 @@ async function carregarCatalogo() {
     try {
         const res = await fetch("/api/antimicrobianos");
         const catalogo = await res.json();
-        const selects = [document.getElementById("slot1"), document.getElementById("slot2"), document.getElementById("slot3")];
+        const selects = [document.getElementById("slot1"), document.getElementById("slot2"), document.getElementById("slot3"), document.getElementById("slot4")];
         selects.forEach(select => {
-            if(select.options.length <= 1) { 
-                catalogo.forEach(item => { const opt = document.createElement("option"); opt.value = item.nome; opt.innerText = item.nome; select.appendChild(opt); });
-            }
+            select.innerHTML = `<option value="">-- Antimicrobiano --</option>`;
+            catalogo.forEach(item => {
+                const opt = document.createElement("option");
+                opt.value = item.nome;
+                opt.innerText = item.nome;
+                select.appendChild(opt);
+            });
         });
     } catch(e) {}
 }
 
 async function extrairPdf() {
     const fileInput = document.getElementById("pdfFile");
-    const textoBrutoInput = document.getElementById("textoBruto").value;
+    const textoManualInput = document.getElementById("textoManual").value;
     
     let formData = new FormData();
     if (fileInput.files[0]) {
         formData.append("file", fileInput.files[0]);
-    } else if (textoBrutoInput.trim() !== "") {
-        formData.append("texto", textoBrutoInput);
+    } else if (textoManualInput.trim() !== "") {
+        formData.append("texto", textoManualInput);
     } else {
-        return alert("Selecione um PDF ou cole o texto da prescrição.");
+        return alert("Selecione um arquivo PDF ou cole o texto da prescrição.");
     }
     
     const res = await fetch("/api/extrair-pdf", { method: "POST", body: formData });
     const data = await res.json();
     
-    if(fileInput.files[0]) {
-        document.getElementById("textoBruto").value = data.texto_anonimizado;
-    }
+    // Guarda o texto bruto de forma oculta sem sujar a caixa manual
+    document.getElementById("textoBrutoOculto").value = data.texto_anonimizado;
     
-    document.getElementById("outrosMedicamentos").value = data.outros_meds.join("\\n");
+    // Destina os medicamentos comuns para o campo de demais medicamentos
+    document.getElementById("outrosMedicamentos").value = data.outros_meds.join(", ");
     
-    const slots = ["slot1", "slot2", "slot3"];
-    slots.forEach(id => document.getElementById(id).value = "");
+    // Limpa os 4 slots antes de distribuir
+    const slots = ["slot1", "slot2", "slot3", "slot4"];
+    slots.forEach(id => {
+        document.getElementById(id).value = "";
+        document.getElementById(id+"_d").value = "";
+        document.getElementById(id+"_poso").value = "";
+        document.getElementById(id+"_dil").value = "";
+    });
     
-    for (let i = 0; i < data.atbs.length && i < 3; i++) {
+    // Preenche cada slot com Nome, Dia, Posologia e Diluente extraídos do PDF
+    for (let i = 0; i < data.atbs.length && i < 4; i++) {
         document.getElementById(slots[i]).value = data.atbs[i].nome;
+        document.getElementById(slots[i]+"_d").value = data.atbs[i].dia || "";
+        document.getElementById(slots[i]+"_poso").value = data.atbs[i].poso || "";
+        document.getElementById(slots[i]+"_dil").value = data.atbs[i].diluente || "";
     }
+
+    const st = document.getElementById("statusExtracao");
+    st.innerText = `Extraído: ${data.atbs.length} antimicrobiano(s) e ${data.outros_meds.length} outro(s) medicamento(s).`;
+    st.classList.remove("d-none");
 }
 
 async function gerarAnalise() {
     const comorbs = $('#comorbidadesSelect').val() || [];
     
     const atbs = [];
-    ['slot1', 'slot2', 'slot3'].forEach(id => {
+    ['slot1', 'slot2', 'slot3', 'slot4'].forEach(id => {
         const nome = document.getElementById(id).value;
         if(nome) {
             atbs.push({
                 nome: nome,
                 dia: document.getElementById(id+'_d').value,
-                poso: document.getElementById(id+'_poso').value
+                poso: document.getElementById(id+'_poso').value,
+                diluente: document.getElementById(id+'_dil').value
             });
         }
     });
     
+    const textoBrutoTotal = document.getElementById("textoBrutoOculto").value + "\n" + document.getElementById("textoManual").value;
+
     const payload = {
         sexo: document.getElementById("sexo").value,
         idade: parseInt(document.getElementById("idade").value) || 0,
@@ -525,7 +673,7 @@ async function gerarAnalise() {
         comorbidades: comorbs,
         antimicrobianos: atbs,
         outros_medicamentos_texto: document.getElementById("outrosMedicamentos").value,
-        texto_prescricao_bruto: document.getElementById("textoBruto").value
+        texto_prescricao_bruto: textoBrutoTotal
     };
 
     const res = await fetch("/api/avaliar", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
@@ -553,6 +701,7 @@ class ATBSlot(BaseModel):
     nome: str
     dia: str
     poso: str
+    diluente: Optional[str] = ""
 
 class AvaliacaoPayload(BaseModel):
     sexo: str
@@ -575,19 +724,22 @@ class NovoUsuario(BaseModel):
     role: str = "user"
 
 @app.get("/", response_class=HTMLResponse)
-def index(): return HTML_TEMPLATE
+def index():
+    return HTML_TEMPLATE
 
 @app.post("/api/login")
 def login(data: LoginData):
     try:
+        garantir_banco()
         conn = sqlite3.connect("radar_clinico.db")
         cursor = conn.cursor()
-        cursor.execute("SELECT role FROM usuarios WHERE username = ? AND password = ?", (data.username, data.password))
+        cursor.execute("SELECT role FROM usuarios WHERE LOWER(username) = LOWER(?) AND password = ?", (data.username.strip(), data.password.strip()))
         user = cursor.fetchone()
         conn.close()
-        if user: return {"success": True, "role": user[0]}
+        if user:
+            return {"success": True, "role": user[0]}
         return {"success": False}
-    except Exception as e:
+    except Exception:
         return {"success": False, "msg": "Erro DB"}
 
 @app.post("/api/usuarios")
@@ -595,98 +747,182 @@ def criar_usuario(data: NovoUsuario):
     try:
         conn = sqlite3.connect("radar_clinico.db")
         cursor = conn.cursor()
-        cursor.execute("INSERT INTO usuarios (username, password, role) VALUES (?, ?, ?)", (data.username, data.password, data.role))
+        cursor.execute("INSERT INTO usuarios (username, password, role) VALUES (?, ?, ?)", (data.username.strip(), data.password.strip(), data.role))
         conn.commit()
         conn.close()
         return {"success": True}
-    except: return {"success": False, "msg": "Erro ou usuário existe."}
+    except Exception:
+        return {"success": False, "msg": "Erro ou usuário já existe."}
 
 @app.get("/api/antimicrobianos")
 def get_antimicrobianos():
+    garantir_banco()
     conn = sqlite3.connect("radar_clinico.db")
     cursor = conn.cursor()
-    try:
-        cursor.execute("SELECT id, nome_generico, nomes_comerciais FROM antimicrobianos ORDER BY nome_generico ASC")
-        rows = cursor.fetchall()
-    except sqlite3.OperationalError:
-        conn.close()
-        return [{"id": 0, "nome": "Carregando...", "nome_generico": "Aguarde"}]
+    cursor.execute("SELECT id, nome_generico, nomes_comerciais FROM antimicrobianos ORDER BY nome_generico ASC")
+    rows = cursor.fetchall()
+    conn.close()
     
     items = []
     for r in rows:
         nome_exibicao = f"{r[1]} ({r[2]})" if r[2] else r[1]
         items.append({"id": r[0], "nome": nome_exibicao, "nome_generico": r[1]})
-    conn.close()
     return items
 
 @app.post("/api/extrair-pdf")
 async def processar_pdf(file: Optional[UploadFile] = File(None), texto: Optional[str] = Form(None)):
+    garantir_banco()
     texto_bruto = ""
     if file:
         reader = pypdf.PdfReader(file.file)
-        texto_bruto = "".join([p.extract_text() or "" for p in reader.pages])
+        paginas = []
+        for p in reader.pages:
+            try:
+                paginas.append(p.extract_text(extraction_mode="layout") or p.extract_text() or "")
+            except Exception:
+                paginas.append(p.extract_text() or "")
+        texto_bruto = "\n".join(paginas)
     elif texto:
         texto_bruto = texto
         
     texto_anon = limpar_texto_prescricao(texto_bruto)
-    texto_lower = texto_anon.lower()
     
+    # Filtra linhas com ordens de suspensão ou alergia
+    linhas_originais = [l.strip() for l in texto_anon.splitlines() if l.strip()]
+    palavras_negacao = ["suspender", "suspenso", "suspensa", "alergia", "alergico", "nao administrar"]
     linhas_validas = []
-    palavras_negacao = ["suspender", "suspenso", "alergia", "não administrar", "parar"]
-    for linha in texto_lower.split("\n"):
-        if not any(neg in linha for neg in palavras_negacao):
+    for linha in linhas_originais:
+        linha_norm = sem_acentos(linha.lower())
+        if not any(neg in linha_norm for neg in palavras_negacao):
             linhas_validas.append(linha)
-    texto_limpo = " ".join(linhas_validas)
+
+    texto_limpo_norm = sem_acentos(" ".join(linhas_validas).lower())
     
     conn = sqlite3.connect("radar_clinico.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT nome_generico, nomes_comerciais FROM antimicrobianos")
+    cursor.execute("SELECT nome_generico, nomes_comerciais, diluente_padrao FROM antimicrobianos")
     atbs_db = cursor.fetchall()
     conn.close()
     
     atbs_encontrados = []
-    for gen, com in atbs_db:
-        nomes_para_buscar = [gen.lower()]
-        if com: nomes_para_buscar.extend([c.strip().lower() for c in com.split(',')])
-        for n in nomes_para_buscar:
-            if n in texto_limpo:
-                atbs_encontrados.append({"nome": f"{gen} ({com})" if com else gen})
-                break
+    genes_ja_incluidos = set()
 
-    dicionario_comuns = ["dipirona", "omeprazol", "pantoprazol", "enoxaparina", "heparina", "furosemida", "losartana", "anlodipino", "ondansetrona", "ondansetrom", "bromoprida", "metoclopramida", "paracetamol"]
-    comuns_encontrados = set()
-    for med in dicionario_comuns:
-        if med in texto_limpo:
-            comuns_encontrados.add(med.capitalize())
-
-    return {
-        "texto_anonimizado": texto_anon if file else texto_bruto,
-        "atbs": atbs_encontrados,
-        "outros_meds": list(comuns_encontrados)
+    # Sinônimos e radicais extras para garantir captura de apresentações hospitalares
+    sinonimos_extras = {
+        "Cefazolina": ["cefazolina", "kefazol", "cezolin"],
+        "Piperacilina + Tazobactam": ["piperacilina", "tazobactam", "tazocin"],
+        "Ampicilina + Sulbactam": ["sulbactam", "unasyn"],
+        "Amoxicilina + Clavulanato": ["clavulanato", "clavulin"],
+        "Imipenem + Cilastatina": ["imipenem", "tienam"],
+        "Sulfametoxazol + Trimetoprima": ["sulfametoxazol", "trimetoprima", "bactrim"],
+        "Ceftazidima + Avibactam": ["avibactam", "zavicefta"],
+        "Polimixina B": ["polimixina b", "polimixina", "bedfordpoly"],
+        "Anfotericina B Lipossomal": ["ambisome", "lipossomal"],
+        "Anfotericina B Desoxicolato": ["fungizon", "desoxicolato"]
     }
 
-def extrair_mg_da_posologia(posologia: str) -> int:
-    if not posologia: return 0
-    match_dose = re.search(r'(\d+)\s*(mg|g)', posologia.lower())
-    match_freq = re.search(r'(12h|8h|6h|24h)', posologia.lower())
+    for idx, linha in enumerate(linhas_validas):
+        linha_norm = sem_acentos(linha.lower())
+        # Junta com a linha seguinte pois muitos sistemas colocam o diluente/posologia abaixo do fármaco
+        bloco_contexto = linha
+        if idx + 1 < len(linhas_validas):
+            bloco_contexto += " " + linhas_validas[idx + 1]
+        if idx + 2 < len(linhas_validas):
+            bloco_contexto += " " + linhas_validas[idx + 2]
+
+        for gen, com, dil_padrao in atbs_db:
+            if gen in genes_ja_incluidos:
+                continue
+            termos_busca = [sem_acentos(gen.lower())]
+            if com:
+                termos_busca.extend([sem_acentos(c.strip().lower()) for c in com.split(",")])
+            if gen in sinonimos_extras:
+                termos_busca.extend(sinonimos_extras[gen])
+
+            achou = False
+            for termo in termos_busca:
+                if termo and re.search(r'\b' + re.escape(termo) + r'\b', linha_norm):
+                    achou = True
+                    break
+            if achou:
+                genes_ja_incluidos.add(gen)
+                detalhes = extrair_detalhes_linha(bloco_contexto)
+                nome_formatado = f"{gen} ({com})" if com else gen
+                atbs_encontrados.append({
+                    "nome": nome_formatado,
+                    "dia": detalhes["dia"],
+                    "poso": detalhes["poso"],
+                    "diluente": detalhes["diluente"] if detalhes["diluente"] else dil_padrao
+                })
+
+    # Dicionário abrangente de medicamentos hospitalares não-antimicrobianos
+    dicionario_comuns = [
+        "dipirona", "paracetamol", "tramadol", "morfina", "fentanil", "metadona", "codeina",
+        "cetoprofeno", "tenoxicam", "dexketoprofeno",
+        "omeprazol", "pantoprazol", "esomeprazol", "ranitidina", "famotidina",
+        "ondansetrona", "bromoprida", "metoclopramida", "dimenidrinato",
+        "enoxaparina", "heparina", "rivaroxabana", "apixabana", "varfarina", "clopidogrel", "aas", "acido acetilsalicilico",
+        "furosemida", "espironolactona", "hidroclorotiazida",
+        "losartana", "enalapril", "captopril", "anlodipino", "nifedipino", "hidralazina", "clonidina",
+        "metoprolol", "carvedilol", "atenolol", "propranolol", "amiodarona", "digoxina",
+        "sinvastatina", "atorvastatina", "rosuvastatina",
+        "insulina", "metformina", "gliclazida", "sitagliptina", "dapagliflozina", "empagliflozina",
+        "hidrocortisona", "dexametasona", "metilprednisolona", "prednisona", "prednisolona",
+        "fenitoina", "acido valproico", "valproato", "levetiracetam", "carbamazepina", "fenobarbital",
+        "haloperidol", "quetiapina", "risperidona", "olanzapina", "clorpromazina",
+        "diazepam", "midazolam", "clonazepam", "lorazepam", "dexmedetomidina",
+        "escitalopram", "sertralina", "fluoxetina", "venlafaxina", "trazodona", "amitriptilina",
+        "pregabalina", "gabapentina", "levodopa", "biperideno",
+        "salbutamol", "ipratropio", "fenoterol", "budesonida", "acetilcisteina",
+        "lactulose", "bisacodil", "simeticona", "loperamida",
+        "noradrenalina", "norepinefrina", "dobutamina", "dopamina", "vasopressina", "nitroprussiato", "nitroglicerina",
+        "cloreto de potassio", "gluconato de calcio", "sulfato de magnesio", "bicarbonato de sodio", "levotiroxina"
+    ]
     
-    if not match_dose: return 0
-    dose = int(match_dose.group(1))
-    if match_dose.group(2) == 'g': dose *= 1000
+    comuns_encontrados = []
+    for med in dicionario_comuns:
+        if re.search(r'\b' + re.escape(med) + r'\b', texto_limpo_norm):
+            nome_cap = med.title()
+            if nome_cap not in comuns_encontrados:
+                comuns_encontrados.append(nome_cap)
+
+    return {
+        "texto_anonimizado": texto_anon,
+        "atbs": atbs_encontrados,
+        "outros_meds": comuns_encontrados
+    }
+
+def extrair_mg_da_posologia(posologia: str) -> float:
+    if not posologia:
+        return 0.0
+    poso_norm = posologia.lower().replace(".", "").replace(",", ".")
+    match_dose = re.search(r'(\d+(?:\.\d+)?)\s*(mg|g|ui)', poso_norm)
+    if not match_dose:
+        return 0.0
     
-    freq_multiplicador = 1
-    if match_freq:
-        if match_freq.group(1) == '12h': freq_multiplicador = 2
-        elif match_freq.group(1) == '8h': freq_multiplicador = 3
-        elif match_freq.group(1) == '6h': freq_multiplicador = 4
+    dose = float(match_dose.group(1))
+    unidade = match_dose.group(2)
+    if unidade == 'g':
+        dose *= 1000.0
+        
+    freq_multiplicador = 1.0
+    if re.search(r'(6/6|6h|4x)', poso_norm):
+        freq_multiplicador = 4.0
+    elif re.search(r'(8/8|8h|3x)', poso_norm):
+        freq_multiplicador = 3.0
+    elif re.search(r'(12/12|12h|2x)', poso_norm):
+        freq_multiplicador = 2.0
+    elif re.search(r'(48/48|48h)', poso_norm):
+        freq_multiplicador = 0.5
         
     return dose * freq_multiplicador
 
 @app.post("/api/avaliar")
 def avaliar_paciente(payload: AvaliacaoPayload):
+    garantir_banco()
     metricas = calcular_metricas(payload.sexo, payload.idade, payload.peso, payload.altura, payload.creatinina)
     clcr = metricas["clcr"]
-    texto_bruto_min = payload.texto_prescricao_bruto.lower()
+    texto_bruto_norm = sem_acentos(payload.texto_prescricao_bruto.lower())
     alertas_count = 0
     
     conn = sqlite3.connect("radar_clinico.db")
@@ -694,126 +930,170 @@ def avaliar_paciente(payload: AvaliacaoPayload):
     
     avaliacoes = []
     farmacotecnias = []
+    incompatibilidades_encontradas = set()
     
+    # 1. Avaliação de Antimicrobianos (Dose Renal + Tempo D + Diluente)
     for atb in payload.antimicrobianos:
         nome_generico = atb.nome.split(" (")[0]
         cursor.execute("SELECT * FROM antimicrobianos WHERE nome_generico = ?", (nome_generico,))
         row = cursor.fetchone()
         if row:
             max_padrao, max_30_50, max_10_30, max_10 = row[4], row[5], row[6], row[7]
-            farm_info = row[9]
+            dil_recomendado, monit, farm_info = row[8], row[9], row[10]
             
-            limite_diario_permitido = 0
-            if clcr >= 50: limite_diario_permitido = max_padrao
-            elif 30 <= clcr < 50: limite_diario_permitido = max_30_50
-            elif 10 <= clcr < 30: limite_diario_permitido = max_10_30
-            else: limite_diario_permitido = max_10
+            if clcr >= 50:
+                limite_diario_permitido = max_padrao
+            elif 30 <= clcr < 50:
+                limite_diario_permitido = max_30_50
+            elif 10 <= clcr < 30:
+                limite_diario_permitido = max_10_30
+            else:
+                limite_diario_permitido = max_10
                 
             dose_diaria_digitada = extrair_mg_da_posologia(atb.poso)
             
-            status_julgamento = ""
             if dose_diaria_digitada == 0:
-                status_julgamento = f"Pendente (Insira a posologia para julgar. Limite max para este ClCr: {limite_diario_permitido}mg/dia)"
+                status_julgamento = f"Pendente de posologia (Teto p/ ClCr {clcr} mL/min: {limite_diario_permitido}mg/dia)"
             elif dose_diaria_digitada > limite_diario_permitido:
-                status_julgamento = f"ALERTA [!]: POSSÍVEL SUPERDOSAGEM para ClCr de {clcr} mL/min (Limite recomendado: {limite_diario_permitido}mg/dia)."
+                status_julgamento = f"ALERTA [!]: SOBREDOSE RENAL ({int(dose_diaria_digitada)}mg/dia excede o limite de {limite_diario_permitido}mg/dia p/ ClCr {clcr} mL/min)."
                 alertas_count += 1
             else:
-                status_julgamento = f"ADEQUADA para a função renal (ClCr {clcr} mL/min)."
+                status_julgamento = f"Posologia ADEQUADA para função renal ({int(dose_diaria_permitido := dose_diaria_digitada)}mg/dia <= Teto {limite_diario_permitido}mg/dia)."
+
+            # Verifica tempo de tratamento prolongado (>D7 / >D10)
+            alerta_tempo = ""
+            m_d = re.search(r'(\d+)', atb.dia or "")
+            if m_d and int(m_d.group(1)) >= 8:
+                alerta_tempo = f" | [ALERTA TEMPO D{m_d.group(1)}: Avaliar descalonamento ou término]"
+                alertas_count += 1
+
+            # Checa compatibilidade do diluente digitado no slot
+            dil_usuario = (atb.diluente or "").strip()
+            alerta_dil_slot = ""
+            dil_norm = sem_acentos(dil_usuario.lower())
+            if dil_norm:
+                cursor.execute("SELECT condicao, alerta FROM regras_farmacotecnicas WHERE LOWER(farmaco) = LOWER(?)", (sem_acentos(nome_generico.lower()),))
+                for cond_regra, msg_alerta in cursor.fetchall():
+                    if cond_regra.lower() in dil_norm:
+                        alerta_dil_slot = f" | [INCOMPATIBILIDADE DILUENTE: {msg_alerta}]"
+                        incompatibilidades_encontradas.add(f"[ALERTA FARMACOTÉCNICO] {nome_generico.upper()} em {dil_usuario.upper()}: {msg_alerta}")
 
             str_dia = f" ({atb.dia})" if atb.dia else ""
-            avaliacoes.append(f"       * {nome_generico}{str_dia}: {atb.poso if atb.poso else 'S/ Posologia'} -> {status_julgamento}")
-            farmacotecnias.append(f"• {nome_generico}: {farm_info}")
+            str_dil = f" | Diluente/Via: {dil_usuario}" if dil_usuario else f" | Diluente sugerido: {dil_recomendado}"
+            avaliacoes.append(f"       * {nome_generico}{str_dia} [{atb.poso if atb.poso else 'Posologia não informada'}]{str_dil} -> {status_julgamento}{alerta_tempo}{alerta_dil_slot}")
+            farmacotecnias.append(f"• {nome_generico} (Monitorar: {monit}): {farm_info}")
 
+    # 2. Avaliação de Comorbidades de Risco
     riscos_comorbidade = set()
     if payload.comorbidades:
         cursor.execute("SELECT comorbidade, farmaco_contraindicado, alerta FROM comorbidades_risco")
         todas_regras_risco = cursor.fetchall()
         
-        nomes_atbs_usados = [a.nome.lower() for a in payload.antimicrobianos]
-        outros_meds_usados = payload.outros_medicamentos_texto.lower()
+        nomes_atbs_usados = [sem_acentos(a.nome.lower()) for a in payload.antimicrobianos]
+        outros_meds_usados = sem_acentos(payload.outros_medicamentos_texto.lower()) + " " + texto_bruto_norm
         
         for doenca_paciente in payload.comorbidades:
             for comorb_regra, farmaco_regra, alerta_regra in todas_regras_risco:
-                if comorb_regra.lower() == doenca_paciente.lower():
-                    if any(farmaco_regra.lower() in atb for atb in nomes_atbs_usados) or farmaco_regra.lower() in outros_meds_usados:
-                        riscos_comorbidade.add(f"[RISCO CLÍNICO] Paciente com {doenca_paciente} em uso de {farmaco_regra}: {alerta_regra}")
+                if sem_acentos(comorb_regra.lower()) == sem_acentos(doenca_paciente.lower()):
+                    farm_norm = sem_acentos(farmaco_regra.lower())
+                    if any(farm_norm in atb for atb in nomes_atbs_usados) or farm_norm in outros_meds_usados:
+                        riscos_comorbidade.add(f"[RISCO POR COMORBIDADE - {doenca_paciente.upper()}] {farmaco_regra}: {alerta_regra}")
                         alertas_count += 1
 
-    incompatibilidades_encontradas = set()
+    # 3. Cruzamento de Interações Medicamentosas (ATBs + Outros Medicamentos)
+    interacoes_detectadas = set()
+    cursor.execute("SELECT droga_a, droga_b, gravidade, mecanismo, conduta FROM interacoes")
+    todas_interacoes = cursor.fetchall()
+    contexto_farmacos = " ".join([sem_acentos(a.nome.lower()) + " " + sem_acentos((a.diluente or "").lower()) for a in payload.antimicrobianos]) + " " + sem_acentos(payload.outros_medicamentos_texto.lower()) + " " + texto_bruto_norm
+    for d_a, d_b, grav, mec, cond in todas_interacoes:
+        if sem_acentos(d_a.lower()) in contexto_farmacos and sem_acentos(d_b.lower()) in contexto_farmacos:
+            interacoes_detectadas.add(f"[INTERAÇÃO {grav.upper()}] {d_a} + {d_b}: {mec}. Conduta: {cond}")
+            alertas_count += 1
+
+    # 4. Motor de Incompatibilidades Farmacotécnicas (Linha a Linha no Texto Bruto)
     cursor.execute("SELECT farmaco, condicao, alerta FROM regras_farmacotecnicas")
     regras = cursor.fetchall()
-    linhas_prescricao = texto_bruto_min.split('\n')
+    linhas_prescricao = texto_bruto_norm.splitlines()
     for farmaco, condicao, alerta in regras:
         for linha in linhas_prescricao:
-            if farmaco.lower() in linha and condicao.lower() in linha:
+            if re.search(r'\b' + re.escape(farmaco.lower()) + r'\b', linha) and re.search(r'\b' + re.escape(condicao.lower()) + r'\b', linha):
                 incompatibilidades_encontradas.add(f"[ALERTA FARMACOTÉCNICO] {farmaco.upper()} + {condicao.upper()}: {alerta}")
                 
     alertas_count += len(incompatibilidades_encontradas)
     conn.close()
 
+    # 5. Filtro Clínico por Exceção (TEV e LAMG)
     is_acamado = "Acamado" in payload.comorbidades
-    meds_gerais = payload.outros_medicamentos_texto.lower() + texto_bruto_min
+    meds_gerais = sem_acentos(payload.outros_medicamentos_texto.lower()) + " " + texto_bruto_norm
     
-    tem_heparina = "heparina" in meds_gerais or "enoxaparina" in meds_gerais or "versan" in meds_gerais
-    tem_ibp = "omeprazol" in meds_gerais or "pantoprazol" in meds_gerais
+    tem_heparina = any(h in meds_gerais for h in ["heparina", "enoxaparina", "versan", "clexane", "rivaroxabana", "apixabana", "varfarina"])
+    tem_ibp = any(i in meds_gerais for i in ["omeprazol", "pantoprazol", "esomeprazol"])
     
-    alerta_tev = ""
     if not tem_heparina and (payload.idade >= 60 or is_acamado):
         alerta_tev = "ALERTA [!]: Paciente de risco (Idoso/Acamado) SEM profilaxia anticoagulante prescrita. Avaliar omissão ou contraindicação."
         alertas_count += 1
     else:
-        alerta_tev = "Conforme (Baixo risco ou Profilaxia já prescrita)."
+        alerta_tev = "Conforme (Baixo risco ou profilaxia anticoagulante ativa)."
         
-    alerta_lamg = ""
     if tem_ibp:
-        alerta_lamg = "ALERTA [!]: Protetor gástrico ativo. Reavaliar indicação (ex: uso de corticoides, risco de sangramento) para prevenir desprescrição inadequada."
+        alerta_lamg = "ALERTA [!]: Protetor gástrico (IBP) ativo na enfermaria. Reavaliar indicação formal para eventual desprescrição segura."
         alertas_count += 1
     else:
-        alerta_lamg = "Conforme (Sem protetor gástrico prescrito)."
+        alerta_lamg = "Conforme (Sem uso desnecessário de IBP)."
 
+    # Montagem do Parecer SOAP
     soap = [
         "=== EVOLUÇÃO FARMACÊUTICA // RADAR CLÍNICO ===",
-        "[S] SUBJETIVO: Acompanhamento da farmacoterapia do leito. Triagem automática da prescrição médica.",
+        "[S] SUBJETIVO: Acompanhamento farmacoterapêutico de enfermaria. Triagem clínica da prescrição médica.",
         "[O] OBJETIVO:",
-        f"    - Idade: {payload.idade} anos | Sexo: {payload.sexo.upper()} | Peso Real: {payload.peso} kg | Altura: {payload.altura} cm",
-        f"    - Função Renal (Cockcroft-Gault): {metricas['clcr']} mL/min (Peso para Ajuste: {metricas['peso_adotado']} kg)",
-        f"    - Comorbidades mapeadas: {', '.join(payload.comorbidades) if payload.comorbidades else 'Nenhuma assinalada'}",
+        f"    - Idade: {payload.idade} anos | Sexo: {payload.sexo.upper()} | Peso Real: {payload.peso} kg | Altura: {payload.altura} cm | IMC: {metricas['imc']} kg/m²",
+        f"    - Função Renal (Cockcroft-Gault): {metricas['clcr']} mL/min (Peso Adotado: {metricas['peso_adotado']} kg)",
+        f"    - Comorbidades / Fatores: {', '.join(payload.comorbidades) if payload.comorbidades else 'Nenhum assinalado'}",
+        f"    - Outros Medicamentos em Uso: {payload.outros_medicamentos_texto if payload.outros_medicamentos_texto else 'Nenhum listado'}",
         "[A] AVALIAÇÃO FARMACÊUTICA:"
     ]
     
-    soap.append("    1. Antimicrobianos (Julgamento Posológico Renal):")
+    soap.append("    1. Terapêutica Antimicrobiana (Julgamento Posológico Renal e Diluição):")
     if avaliacoes:
-        for a in avaliacoes: soap.append(a)
+        for a in avaliacoes:
+            soap.append(a)
     else: 
         soap.append("       * Nenhum antimicrobiano submetido à avaliação.")
     
-    soap.append("    2. Profilaxias Institucionais (Filtro por Exceção):")
+    soap.append("    2. Profilaxias Institucionais (Triagem por Exceção):")
     soap.append(f"       * TEV: {alerta_tev}")
     soap.append(f"       * LAMG: {alerta_lamg}")
 
+    if interacoes_detectadas:
+        soap.append("    3. Interações Medicamentosas Relevantes:")
+        for inter in interacoes_detectadas:
+            soap.append(f"       * {inter}")
+
     if riscos_comorbidade:
-        soap.append("    3. Alertas de Segurança por Comorbidade:")
-        for risco in riscos_comorbidade: soap.append(f"       * {risco}")
+        soap.append("    4. Alertas de Segurança por Comorbidades:")
+        for risco in riscos_comorbidade:
+            soap.append(f"       * {risco}")
 
     if incompatibilidades_encontradas:
-        soap.append("    4. Incompatibilidades Farmacotécnicas Detectadas:")
-        for inc in incompatibilidades_encontradas: soap.append(f"       * {inc}")
+        soap.append("    5. Incompatibilidades Farmacotécnicas e Vias:")
+        for inc in incompatibilidades_encontradas:
+            soap.append(f"       * {inc}")
 
-    soap.append("[P] PLANO DE CUIDADO:")
-    soap.append("    1. Sugerir adequação clínica/posológica à equipe médica conforme os alertas acima.")
+    soap.append("[P] PLANO DE CUIDADO FARMACÊUTICO:")
+    soap.append("    1. Discutir intervenções e ajustes posológicos com a equipe médica/enfermagem conforme alertas acima.")
     if farmacotecnias:
-        soap.append("    2. Orientações de Reconstituição e Diluição (Preparo/Enfermagem):")
-        for f in farmacotecnias: soap.append(f"       {f}")
+        soap.append("    2. Recomendações Técnicas de Reconstituição, Diluição e Tempo de Infusão:")
+        for f in farmacotecnias:
+            soap.append(f"       {f}")
 
     return {"metricas": metricas, "soap": "\n".join(soap), "alertas_count": alertas_count}
 
-# ROTA PARA FORÇAR A CRIAÇÃO DA BASE DE DADOS MANUALMENTE
 @app.get("/setup-manual")
 def setup_manual():
     try:
         import setup_db
         setup_db.setup_database()
-        return {"mensagem": "Base de dados recriada com sucesso com Noberto e admin123!"}
+        return {"mensagem": "Base de dados recriada com sucesso com 35 antimicrobianos e credenciais Noberto / admin123!"}
     except Exception as e:
         return {"erro": str(e)}
 
