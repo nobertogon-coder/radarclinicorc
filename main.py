@@ -2,7 +2,7 @@ import sqlite3
 import re
 import os
 from typing import List, Optional
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -12,19 +12,6 @@ import webbrowser
 import uvicorn
 
 app = FastAPI(title="Radar Clínico", description="Sistema de Apoio à Decisão Farmacêutica")
-
-# ==============================================================================
-# AUTO-REPARAÇÃO DA BASE DE DADOS
-# ==============================================================================
-@app.on_event("startup")
-def verificar_base_dados():
-    print("Iniciando verificação da base de dados no arranque...")
-    import setup_db
-    try:
-        setup_db.setup_database()
-        print("Base de dados gerada/atualizada com sucesso no arranque.")
-    except Exception as e:
-        print(f"Erro crítico ao forçar a base de dados no arranque: {e}")
 
 if os.path.isdir("static"):
     app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -125,7 +112,6 @@ HTML_TEMPLATE = """
         .slot-row > select { flex: 2; }
         .slot-row > input { flex: 1; }
 
-        /* Estilos Comorbidades (Tags Baseado no Radar Beers) */
         .select2-container--default .select2-selection--multiple {
             border: 1px solid #d1d5db;
             border-radius: 8px;
@@ -165,7 +151,6 @@ HTML_TEMPLATE = """
         }
         .tag-btn:hover { background-color: #e5e7eb; }
         
-        /* Botao Extrair Escuro */
         .btn-extrair {
             background-color: #1e293b;
             color: white;
@@ -180,7 +165,6 @@ HTML_TEMPLATE = """
         }
         .btn-extrair:hover { background-color: #0f172a; color: white; }
 
-        /* Input File Customizado Verde Claro */
         .custom-file-upload {
             border: 1px solid #86efac;
             background-color: #dcfce7;
@@ -503,17 +487,13 @@ async function extrairPdf() {
     const res = await fetch("/api/extrair-pdf", { method: "POST", body: formData });
     const data = await res.json();
     
-    // Atualiza o texto bruto caso tenha vindo de PDF
     if(fileInput.files[0]) {
         document.getElementById("textoBruto").value = data.texto_anonimizado;
     }
     
-    // Destina os medicamentos comuns para o novo campo isolado
-    document.getElementById("outrosMedicamentos").value = data.outros_meds.join("\n");
+    document.getElementById("outrosMedicamentos").value = data.outros_meds.join("\\n");
     
-    // Destina os antimicrobianos para os slots
     const slots = ["slot1", "slot2", "slot3"];
-    // Limpa slots anteriores
     slots.forEach(id => document.getElementById(id).value = "");
     
     for (let i = 0; i < data.atbs.length && i < 3; i++) {
@@ -639,7 +619,6 @@ def get_antimicrobianos():
     conn.close()
     return items
 
-from fastapi import Form
 @app.post("/api/extrair-pdf")
 async def processar_pdf(file: Optional[UploadFile] = File(None), texto: Optional[str] = Form(None)):
     texto_bruto = ""
@@ -827,6 +806,16 @@ def avaliar_paciente(payload: AvaliacaoPayload):
         for f in farmacotecnias: soap.append(f"       {f}")
 
     return {"metricas": metricas, "soap": "\n".join(soap), "alertas_count": alertas_count}
+
+# ROTA PARA FORÇAR A CRIAÇÃO DA BASE DE DADOS MANUALMENTE
+@app.get("/setup-manual")
+def setup_manual():
+    try:
+        import setup_db
+        setup_db.setup_database()
+        return {"mensagem": "Base de dados recriada com sucesso com Noberto e admin123!"}
+    except Exception as e:
+        return {"erro": str(e)}
 
 if __name__ == "__main__":
     threading.Timer(1.5, lambda: webbrowser.open("http://127.0.0.1:8000")).start()
