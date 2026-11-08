@@ -347,13 +347,14 @@ function addComorbidade(tag) {
     }
 }
 
-function updateFileName(input) {
-    const display = document.getElementById('fileNameDisplay');
-    if (input.files && input.files.length > 0) {
-        let name = input.files[0].name;
-        display.innerText = name.length > 25 ? name.substring(0, 12) + '...' + name.substring(name.length - 8) : name;
-    } else {
-        display.innerText = "Nenhum arquivo escolhido";
+function fazerLogin() {
+    // Esconde o login e mostra o painel na hora, sem perguntar nada ao servidor
+    document.getElementById('login-view').classList.add('d-none');
+    document.getElementById('app-view').classList.remove('d-none');
+    document.getElementById('btnAdmin').classList.remove('d-none');
+    
+    // Puxa a lista de antibióticos
+    carregarCatalogo();
     }
 }
 
