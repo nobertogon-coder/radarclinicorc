@@ -743,15 +743,14 @@ def teste_login():
     return {"status": "Login direto ativo para Noberto / admin123"}
 
 @app.post("/api/login")
-def login(data: LoginData):
-    u = data.username.strip().lower()
-    p = data.password.strip()
+def login(data: dict):
+    u = str(data.get("username", "")).strip().lower()
+    p = str(data.get("password", "")).strip()
     
-    # 1. BYPASS DIRETO GARANTIDO (Funciona sempre, independente do banco!)
-    if (u == "noberto" and p in ["admin123", "admin"]) or (u == "admin" and p in ["admin123", "admin"]):
+    # Bypass direto infalível para o seu usuário
+    if (u in ["noberto", "admin"]) and (p in ["admin123", "admin"]):
         return {"success": True, "role": "admin"}
-
-    # 2. Consulta secundária ao banco para outros usuários criados
+        
     try:
         garantir_banco()
         conn = sqlite3.connect("radar_clinico.db")
@@ -761,9 +760,10 @@ def login(data: LoginData):
         conn.close()
         if user:
             return {"success": True, "role": user[0]}
-        return {"success": False}
     except Exception:
-        return {"success": False}
+        pass
+        
+    return {"success": False}
 
 @app.post("/api/usuarios")
 def criar_usuario(data: NovoUsuario):
