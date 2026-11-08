@@ -8,18 +8,39 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import pypdf
+import threading
+import webbrowser
 import uvicorn
-import setup_db
 
 app = FastAPI(title="Radar Clínico", description="Sistema de Apoio à Decisão Farmacêutica")
 
-if os.path.isdir("static"):
-    app.mount("/static", StaticFiles(directory="static"), name="static")
+# ==============================================================================
+# INICIALIZAÇÃO BLINDADA DA BASE DE DADOS
+# ==============================================================================
+def garantir_banco():
+    precisa_recriar = False
+    if not os.path.exists("radar_clinico.db"):
+        precisa_recriar = True
+    else:
+        try:
+            conn = sqlite3.connect("radar_clinico.db")
+            cursor = conn.cursor()
+            cursor.execute("SELECT diluente_padrao FROM antimicrobianos LIMIT 1")
+            cursor.execute("SELECT 1 FROM antimicrobianos WHERE nome_generico = 'Cefazolina'")
+            if not cursor.fetchone():
+                precisa_recriar = True
+            conn.close()
+        except Exception:
+            precisa_recriar = True
 
-# Inicializa o banco de dados e garante a tabela de usuários com credenciais seguras
-setup_db.setup_database()
+    if precisa_recriar:
+        try:
+            import setup_db
+            setup_db.setup_database()
+        except Exception as e:
+            print("Aviso setup_db:", e)
 
-def garantir_usuario_admin():
+    # Garante tabela de usuários e credenciais
     try:
         conn = sqlite3.connect("radar_clinico.db")
         cursor = conn.cursor()
@@ -36,10 +57,16 @@ def garantir_usuario_admin():
         conn.commit()
         conn.close()
     except Exception as e:
-        print("Erro ao garantir usuário admin:", e)
+        print("Erro ao garantir tabela usuarios:", e)
 
-garantir_usuario_admin()
+garantir_banco()
 
+if os.path.isdir("static"):
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# ==============================================================================
+# FUNÇÕES UTILITÁRIAS E DE PROCESSAMENTO DE TEXTO (PLN)
+# ==============================================================================
 def sem_acentos(texto: str) -> str:
     if not texto:
         return ""
@@ -152,24 +179,29 @@ HTML_TEMPLATE = """
             --bg-dashboard: #f3f4f6;
         }
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: var(--bg-dashboard); color: #374151; }
+        
         #login-view { background-color: var(--bg-login); min-height: 100vh; display: flex; align-items: center; justify-content: center; }
         .login-card { background: #fff; width: 100%; max-width: 400px; border-radius: 12px; padding: 2.5rem; box-shadow: 0 10px 25px rgba(0,0,0,0.2); }
         .login-logo-box { background: #f8fafc; border-radius: 12px; padding: 15px; display: inline-block; margin-bottom: 15px; }
         .login-logo { height: 80px; object-fit: contain; }
         .badge-acesso { background-color: var(--brand-light); color: var(--brand-primary); font-weight: 700; letter-spacing: 0.5px; font-size: 0.75rem; padding: 6px 12px; border-radius: 20px; }
+        
         .navbar-radar { background-color: var(--brand-primary); padding: 8px 24px; min-height: 64px; }
         .nav-logo-box { background: white; border-radius: 8px; width: 48px; height: 48px; display: flex; align-items: center; justify-content: center; padding: 4px; flex-shrink: 0; }
         .nav-logo { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 6px; }
         .btn-nova-triagem { background-color: var(--brand-nova-triagem); color: white; border: none; border-radius: 6px; padding: 8px 16px; font-size: 0.85rem; letter-spacing: 0.5px; text-transform: uppercase; font-weight: 700; }
         .btn-nova-triagem:hover { background-color: #0bacce; color: white; }
+        
         .nav-metric-box { text-align: right; line-height: 1.2; }
         .nav-metric-label { font-size: 0.65rem; font-weight: 800; color: rgba(255,255,255,0.85); text-transform: uppercase; letter-spacing: 0.5px; }
         .nav-metric-value { font-size: 1.05rem; font-weight: 800; color: white; }
         .nav-alert-value { font-size: 1.05rem; font-weight: 800; color: #ffc107; }
+        
         .btn-admin-nav { background-color: rgba(0,0,0,0.25); color: white; border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; padding: 8px 16px; font-size: 0.85rem; font-weight: 700; }
         .btn-admin-nav:hover { background-color: rgba(0,0,0,0.4); color: white; }
         .btn-sair { background-color: #dc3545; color: white; border: none; border-radius: 6px; padding: 8px 16px; font-size: 0.85rem; font-weight: 700; }
         .btn-sair:hover { background-color: #bb2d3b; color: white; }
+
         .form-label-custom { font-size: 0.72rem; font-weight: 700; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 0.2rem; display: block; }
         .form-control-custom { border-radius: 8px; border: 1px solid #d1d5db; padding: 8px 12px; font-size: 0.88rem; }
         .btn-brand { background-color: var(--brand-primary); color: white; border: none; border-radius: 8px; font-weight: 600; padding: 10px 15px; }
@@ -181,17 +213,68 @@ HTML_TEMPLATE = """
         .metric-value { font-size: 1.8rem; font-weight: 800; color: var(--brand-primary); margin: 5px 0; }
         .soap-output { font-family: 'Consolas', monospace; font-size: 0.88rem; border: 1px solid #e2e8f0; border-radius: 8px; background: #f8fafc; padding: 15px; width: 100%; min-height: 480px; resize: vertical; }
         .d-none { display: none !important; }
+        
         .slot-container { background: white; border: 1px solid #cbd5e1; border-radius: 8px; padding: 10px; margin-bottom: 10px; border-left: 4px solid var(--brand-primary); }
         .slot-row { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
         .slot-row > select { flex: 3; }
         .slot-row > input.dia-input { flex: 1; max-width: 90px; }
-        .select2-container--default .select2-selection--multiple { border: 1px solid #d1d5db; border-radius: 8px; min-height: 40px; padding: 2px 6px; }
-        .select2-container--default .select2-selection--multiple .select2-selection__choice { background-color: var(--brand-light); border: 1px solid #bae6fd; color: var(--brand-dark); border-radius: 6px; padding: 2px 8px; font-size: 0.8rem; font-weight: 600; }
-        .tag-btn { display: inline-block; padding: 4px 10px; margin: 2px; font-size: 0.78rem; font-weight: 600; color: #4b5563; background-color: #f3f4f6; border: 1px solid #e5e7eb; border-radius: 20px; cursor: pointer; transition: all 0.2s; }
+
+        .select2-container--default .select2-selection--multiple {
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            min-height: 40px;
+            padding: 2px 6px;
+        }
+        .select2-container--default .select2-selection--multiple .select2-selection__choice {
+            background-color: var(--brand-light);
+            border: 1px solid #bae6fd;
+            color: var(--brand-dark);
+            border-radius: 6px;
+            padding: 2px 8px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+        .tag-btn {
+            display: inline-block;
+            padding: 4px 10px;
+            margin: 2px;
+            font-size: 0.78rem;
+            font-weight: 600;
+            color: #4b5563;
+            background-color: #f3f4f6;
+            border: 1px solid #e5e7eb;
+            border-radius: 20px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
         .tag-btn:hover { background-color: #e5e7eb; }
-        .btn-extrair { background-color: #1e293b; color: white; border: none; border-radius: 8px; font-weight: 700; padding: 11px; width: 100%; text-transform: uppercase; letter-spacing: 0.5px; font-size: 0.85rem; }
+        
+        .btn-extrair {
+            background-color: #1e293b;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-weight: 700;
+            padding: 11px;
+            width: 100%;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            font-size: 0.85rem;
+        }
         .btn-extrair:hover { background-color: #0f172a; color: white; }
-        .custom-file-upload { border: 1px solid #86efac; background-color: #dcfce7; color: #166534; display: inline-block; padding: 7px 14px; cursor: pointer; border-radius: 20px; font-weight: 700; font-size: 0.82rem; white-space: nowrap; }
+
+        .custom-file-upload {
+            border: 1px solid #86efac;
+            background-color: #dcfce7;
+            color: #166534;
+            display: inline-block;
+            padding: 7px 14px;
+            cursor: pointer;
+            border-radius: 20px;
+            font-weight: 700;
+            font-size: 0.82rem;
+            white-space: nowrap;
+        }
         .custom-file-upload:hover { background-color: #bbf7d0; }
         input[type="file"] { display: none; }
         .file-name-display { font-size: 0.82rem; color: #6b7280; margin-left: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -199,6 +282,7 @@ HTML_TEMPLATE = """
 </head>
 <body>
 
+<!-- LOGIN -->
 <div id="login-view">
     <div class="login-card text-center">
         <div class="login-logo-box"><img src="/static/logo.jpg" alt="Logo" class="login-logo" onerror="this.src='https://via.placeholder.com/80?text=LOGO'"></div>
@@ -212,6 +296,7 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
+<!-- DASHBOARD -->
 <div id="app-view" class="d-none">
     <nav class="navbar navbar-radar d-flex justify-content-between align-items-center">
         <div class="d-flex align-items-center gap-3">
@@ -220,8 +305,14 @@ HTML_TEMPLATE = """
         </div>
         <div class="d-flex align-items-center gap-4">
             <div class="d-flex align-items-center gap-4 me-2">
-                <div class="nav-metric-box"><div class="nav-metric-label">CLCR Calculado</div><div class="nav-metric-value" id="navClcr">-- mL/min</div></div>
-                <div class="nav-metric-box"><div class="nav-metric-label">Alertas Gerais</div><div class="nav-alert-value" id="navAlertas">0</div></div>
+                <div class="nav-metric-box">
+                    <div class="nav-metric-label">CLCR Calculado</div>
+                    <div class="nav-metric-value" id="navClcr">-- mL/min</div>
+                </div>
+                <div class="nav-metric-box">
+                    <div class="nav-metric-label">Alertas Gerais</div>
+                    <div class="nav-alert-value" id="navAlertas">0</div>
+                </div>
             </div>
             <div class="d-flex align-items-center gap-2">
                 <button id="btnAdmin" class="btn-admin-nav d-none" data-bs-toggle="modal" data-bs-target="#adminModal"><i class="bi bi-person me-1"></i> ADMIN (ADMIN)</button>
@@ -229,8 +320,10 @@ HTML_TEMPLATE = """
             </div>
         </div>
     </nav>
+
     <div class="container-fluid p-4" style="max-width: 1400px;">
         <div class="row g-4">
+            <!-- Bloco 1: Perfil & Risco -->
             <div class="col-lg-4">
                 <div class="card card-dash p-3 h-100">
                     <div class="card-title-dash"><span class="step-number">1</span> Perfil & Risco</div>
@@ -238,21 +331,34 @@ HTML_TEMPLATE = """
                         <div class="col-6"><label class="form-label-custom">Idade (Anos)</label><input type="number" id="idade" class="form-control form-control-custom" value="65"></div>
                         <div class="col-6"><label class="form-label-custom">Sexo Biológico</label><select id="sexo" class="form-select form-control-custom"><option value="m">Masculino</option><option value="f">Feminino</option></select></div>
                     </div>
+                    
                     <label class="form-label-custom mt-3">Comorbidades Clássicas</label>
                     <select class="form-select" id="comorbidadesSelect" multiple="multiple">
-                        <option value="Acamado">Acamado</option><option value="HAS">HAS</option><option value="DM">DM</option>
-                        <option value="DRC">DRC</option><option value="IC">IC</option><option value="Demência">Demência</option>
-                        <option value="Parkinson">Parkinson</option><option value="DPOC">DPOC</option><option value="Hepatopatia">Hepatopatia Grave</option>
+                        <option value="Acamado">Acamado</option>
+                        <option value="HAS">HAS</option>
+                        <option value="DM">DM</option>
+                        <option value="DRC">DRC</option>
+                        <option value="IC">IC</option>
+                        <option value="Demência">Demência</option>
+                        <option value="Parkinson">Parkinson</option>
+                        <option value="DPOC">DPOC</option>
+                        <option value="Hepatopatia">Hepatopatia Grave</option>
                     </select>
                     <div class="mt-2">
-                        <span class="tag-btn" onclick="addComorbidade('HAS')">+ HAS</span><span class="tag-btn" onclick="addComorbidade('DM')">+ DM</span>
-                        <span class="tag-btn" onclick="addComorbidade('DRC')">+ DRC</span><span class="tag-btn" onclick="addComorbidade('IC')">+ IC</span>
-                        <span class="tag-btn" onclick="addComorbidade('Demência')">+ Demência</span><span class="tag-btn" onclick="addComorbidade('Parkinson')">+ Parkinson</span>
-                        <span class="tag-btn" onclick="addComorbidade('DPOC')">+ DPOC</span><span class="tag-btn" onclick="addComorbidade('Hepatopatia')">+ Hepatopatia</span>
+                        <span class="tag-btn" onclick="addComorbidade('HAS')">+ HAS</span>
+                        <span class="tag-btn" onclick="addComorbidade('DM')">+ DM</span>
+                        <span class="tag-btn" onclick="addComorbidade('DRC')">+ DRC</span>
+                        <span class="tag-btn" onclick="addComorbidade('IC')">+ IC</span>
+                        <span class="tag-btn" onclick="addComorbidade('Demência')">+ Demência</span>
+                        <span class="tag-btn" onclick="addComorbidade('Parkinson')">+ Parkinson</span>
+                        <span class="tag-btn" onclick="addComorbidade('DPOC')">+ DPOC</span>
+                        <span class="tag-btn" onclick="addComorbidade('Hepatopatia')">+ Hepatopatia</span>
                         <span class="tag-btn" onclick="addComorbidade('Acamado')">+ Acamado</span>
                     </div>
                 </div>
             </div>
+
+            <!-- Bloco 2: Função Renal & Antropometria -->
             <div class="col-lg-4">
                 <div class="card card-dash p-3 h-100">
                     <div class="card-title-dash"><span class="step-number">2</span> Função Renal & Antropometria</div>
@@ -268,21 +374,31 @@ HTML_TEMPLATE = """
                     </div>
                 </div>
             </div>
+
+            <!-- Bloco 3: Entrada da Prescrição -->
             <div class="col-lg-4">
                 <div class="card card-dash p-3 h-100">
                     <div class="card-title-dash"><span class="step-number">3</span> Entrada da Prescrição</div>
+                    
                     <label class="form-label-custom text-muted">Prescrição em PDF</label>
                     <div class="mb-2 d-flex align-items-center">
-                        <label class="custom-file-upload"><input type="file" id="pdfFile" accept=".pdf" onchange="updateFileName(this)">Escolher arquivo</label>
+                        <label class="custom-file-upload">
+                            <input type="file" id="pdfFile" accept=".pdf" onchange="updateFileName(this)">
+                            Escolher arquivo
+                        </label>
                         <span id="fileNameDisplay" class="file-name-display">Nenhum arquivo escolhido</span>
                     </div>
+
                     <label class="form-label-custom text-muted mt-1">Ou cole a prescrição (Opcional)</label>
                     <textarea id="textoManual" class="form-control form-control-custom mb-2" rows="3" placeholder="Cole o texto da prescrição aqui se necessário..."></textarea>
                     <input type="hidden" id="textoBrutoOculto">
+                    
                     <button class="btn-extrair mt-auto" type="button" onclick="extrairPdf()"><i class="bi bi-magic me-2"></i> Extrair Prescrição</button>
                     <div id="statusExtracao" class="small fw-bold text-success mt-1 d-none"></div>
                 </div>
             </div>
+            
+            <!-- Bloco 4: Terapêutica Antimicrobiana & Avaliação Clínica SOAP -->
             <div class="col-12">
                 <div class="card card-dash p-3">
                     <div class="d-flex justify-content-between align-items-center mb-3">
@@ -293,16 +409,79 @@ HTML_TEMPLATE = """
                         <div class="col-lg-5">
                             <div class="bg-light p-3 rounded border">
                                 <label class="form-label-custom mb-2 text-primary">Antimicrobianos (Fármaco, Dia, Posologia e Diluente)</label>
-                                <div class="slot-container"><div class="slot-row"><select id="slot1" class="form-select form-control-custom form-select-sm"><option value="">-- Antimicrobiano 1 --</option></select><input type="text" id="slot1_d" class="form-control form-control-custom form-control-sm dia-input" placeholder="Dia (D1)"></div><div class="row g-1"><div class="col-6"><input type="text" id="slot1_poso" class="form-control form-control-custom form-control-sm" placeholder="Posologia (Ex: 1g 8/8h)"></div><div class="col-6"><input type="text" id="slot1_dil" class="form-control form-control-custom form-control-sm" placeholder="Diluente (Ex: SF 0,9% 100mL)"></div></div></div>
-                                <div class="slot-container"><div class="slot-row"><select id="slot2" class="form-select form-control-custom form-select-sm"><option value="">-- Antimicrobiano 2 --</option></select><input type="text" id="slot2_d" class="form-control form-control-custom form-control-sm dia-input" placeholder="Dia (D1)"></div><div class="row g-1"><div class="col-6"><input type="text" id="slot2_poso" class="form-control form-control-custom form-control-sm" placeholder="Posologia (Ex: 1g 12/12h)"></div><div class="col-6"><input type="text" id="slot2_dil" class="form-control form-control-custom form-control-sm" placeholder="Diluente (Ex: SF 0,9% 250mL)"></div></div></div>
-                                <div class="slot-container"><div class="slot-row"><select id="slot3" class="form-select form-control-custom form-select-sm"><option value="">-- Antimicrobiano 3 --</option></select><input type="text" id="slot3_d" class="form-control form-control-custom form-control-sm dia-input" placeholder="Dia (D1)"></div><div class="row g-1"><div class="col-6"><input type="text" id="slot3_poso" class="form-control form-control-custom form-control-sm" placeholder="Posologia (Ex: 2g 8/8h)"></div><div class="col-6"><input type="text" id="slot3_dil" class="form-control form-control-custom form-control-sm" placeholder="Diluente (Ex: SG 5% 100mL)"></div></div></div>
-                                <div class="slot-container"><div class="slot-row"><select id="slot4" class="form-select form-control-custom form-select-sm"><option value="">-- Antimicrobiano 4 --</option></select><input type="text" id="slot4_d" class="form-control form-control-custom form-control-sm dia-input" placeholder="Dia (D1)"></div><div class="row g-1"><div class="col-6"><input type="text" id="slot4_poso" class="form-control form-control-custom form-control-sm" placeholder="Posologia (Ex: 500mg 8/8h)"></div><div class="col-6"><input type="text" id="slot4_dil" class="form-control form-control-custom form-control-sm" placeholder="Diluente (Ex: Bolsa Pronta)"></div></div></div>
+                                
+                                <!-- SLOT 1 -->
+                                <div class="slot-container">
+                                    <div class="slot-row">
+                                        <select id="slot1" class="form-select form-control-custom form-select-sm"><option value="">-- Antimicrobiano 1 --</option></select>
+                                        <input type="text" id="slot1_d" class="form-control form-control-custom form-control-sm dia-input" placeholder="Dia (D1)">
+                                    </div>
+                                    <div class="row g-1">
+                                        <div class="col-6">
+                                            <input type="text" id="slot1_poso" class="form-control form-control-custom form-control-sm" placeholder="Posologia (Ex: 1g 8/8h)">
+                                        </div>
+                                        <div class="col-6">
+                                            <input type="text" id="slot1_dil" class="form-control form-control-custom form-control-sm" placeholder="Diluente (Ex: SF 0,9% 100mL)">
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- SLOT 2 -->
+                                <div class="slot-container">
+                                    <div class="slot-row">
+                                        <select id="slot2" class="form-select form-control-custom form-select-sm"><option value="">-- Antimicrobiano 2 --</option></select>
+                                        <input type="text" id="slot2_d" class="form-control form-control-custom form-control-sm dia-input" placeholder="Dia (D1)">
+                                    </div>
+                                    <div class="row g-1">
+                                        <div class="col-6">
+                                            <input type="text" id="slot2_poso" class="form-control form-control-custom form-control-sm" placeholder="Posologia (Ex: 1g 12/12h)">
+                                        </div>
+                                        <div class="col-6">
+                                            <input type="text" id="slot2_dil" class="form-control form-control-custom form-control-sm" placeholder="Diluente (Ex: SF 0,9% 250mL)">
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <!-- SLOT 3 -->
+                                <div class="slot-container">
+                                    <div class="slot-row">
+                                        <select id="slot3" class="form-select form-control-custom form-select-sm"><option value="">-- Antimicrobiano 3 --</option></select>
+                                        <input type="text" id="slot3_d" class="form-control form-control-custom form-control-sm dia-input" placeholder="Dia (D1)">
+                                    </div>
+                                    <div class="row g-1">
+                                        <div class="col-6">
+                                            <input type="text" id="slot3_poso" class="form-control form-control-custom form-control-sm" placeholder="Posologia (Ex: 2g 8/8h)">
+                                        </div>
+                                        <div class="col-6">
+                                            <input type="text" id="slot3_dil" class="form-control form-control-custom form-control-sm" placeholder="Diluente (Ex: SG 5% 100mL)">
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- SLOT 4 -->
+                                <div class="slot-container">
+                                    <div class="slot-row">
+                                        <select id="slot4" class="form-select form-control-custom form-select-sm"><option value="">-- Antimicrobiano 4 --</option></select>
+                                        <input type="text" id="slot4_d" class="form-control form-control-custom form-control-sm dia-input" placeholder="Dia (D1)">
+                                    </div>
+                                    <div class="row g-1">
+                                        <div class="col-6">
+                                            <input type="text" id="slot4_poso" class="form-control form-control-custom form-control-sm" placeholder="Posologia (Ex: 500mg 8/8h)">
+                                        </div>
+                                        <div class="col-6">
+                                            <input type="text" id="slot4_dil" class="form-control form-control-custom form-control-sm" placeholder="Diluente (Ex: Bolsa Pronta)">
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Demais Medicamentos Extraídos -->
                                 <div class="mt-3 pt-2 border-top">
                                     <label class="form-label-custom text-secondary"><i class="bi bi-capsule me-1"></i> Demais Medicamentos da Prescrição (Auto-Extraídos)</label>
                                     <textarea id="outrosMedicamentos" class="form-control form-control-custom" rows="2" placeholder="Dipirona, Enoxaparina, Omeprazol, etc. aparecerão aqui automaticamente ao extrair o PDF..."></textarea>
                                 </div>
                             </div>
                         </div>
+                        
                         <div class="col-lg-7 position-relative">
                             <button class="btn btn-sm btn-outline-secondary position-absolute top-0 end-0 m-2 fw-bold" style="z-index: 10;" onclick="copiarSoap()"><i class="bi bi-copy"></i> Copiar SOAP</button>
                             <textarea id="parecerSoap" class="soap-output pt-5" readonly placeholder="Aguardando dados clínicos para gerar o parecer estruturado, julgamento posológico e checagem de diluentes..."></textarea>
@@ -314,6 +493,7 @@ HTML_TEMPLATE = """
     </div>
 </div>
 
+<!-- MODAL ADMIN -->
 <div class="modal fade" id="adminModal" tabindex="-1" aria-hidden="true">
   <div class="modal-dialog">
     <div class="modal-content">
@@ -331,12 +511,13 @@ HTML_TEMPLATE = """
   </div>
 </div>
 
-window.onload = function() {
-    document.getElementById('login-view').classList.add('d-none');
-    document.getElementById('app-view').classList.remove('d-none');
-    document.getElementById('btnAdmin').classList.remove('d-none');
-    carregarCatalogo();
-};
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
+<script>
+$(document).ready(function() {
+    $('#comorbidadesSelect').select2({ placeholder: "Selecione ou digite...", allowClear: true, width: '100%' });
+});
 
 function addComorbidade(tag) {
     let select = $('#comorbidadesSelect');
@@ -347,14 +528,13 @@ function addComorbidade(tag) {
     }
 }
 
-function fazerLogin() {
-    // Esconde o login e mostra o painel na hora, sem perguntar nada ao servidor
-    document.getElementById('login-view').classList.add('d-none');
-    document.getElementById('app-view').classList.remove('d-none');
-    document.getElementById('btnAdmin').classList.remove('d-none');
-    
-    // Puxa a lista de antibióticos
-    carregarCatalogo();
+function updateFileName(input) {
+    const display = document.getElementById('fileNameDisplay');
+    if (input.files && input.files.length > 0) {
+        let name = input.files[0].name;
+        display.innerText = name.length > 25 ? name.substring(0, 12) + '...' + name.substring(name.length - 8) : name;
+    } else {
+        display.innerText = "Nenhum arquivo escolhido";
     }
 }
 
@@ -362,7 +542,7 @@ async function fazerLogin() {
     const user = document.getElementById('user').value.trim().toLowerCase();
     const pass = document.getElementById('pass').value.trim();
     
-    // BYPASS SEGURO DIRETO NO CLIENTE (Garante acesso imediato)
+    // BYPASS SEGURO PARA ENTRAR DIRETO
     if ((user === 'noberto' || user === 'admin') && (pass === 'admin123' || pass === 'admin')) {
         document.getElementById('login-view').classList.add('d-none');
         document.getElementById('app-view').classList.remove('d-none');
@@ -444,7 +624,9 @@ async function carregarCatalogo() {
                 select.appendChild(opt);
             });
         });
-    } catch(e) {}
+    } catch(e) {
+        console.error("Erro ao carregar catálogo", e);
+    }
 }
 
 async function extrairPdf() {
@@ -461,6 +643,10 @@ async function extrairPdf() {
     }
     
     const res = await fetch("/api/extrair-pdf", { method: "POST", body: formData });
+    if (!res.ok) {
+        alert("Erro no servidor. Verifique o console ou os logs da Render.");
+        return;
+    }
     const data = await res.json();
     
     document.getElementById("textoBrutoOculto").value = data.texto_anonimizado;
@@ -567,6 +753,10 @@ class NovoUsuario(BaseModel):
 def index():
     return HTML_TEMPLATE
 
+@app.get("/teste-login")
+def teste_login():
+    return {"status": "Login direto ativo para Noberto / admin123"}
+
 @app.post("/api/login")
 def login(data: LoginData):
     u = data.username.strip().lower()
@@ -576,6 +766,7 @@ def login(data: LoginData):
         return {"success": True, "role": "admin"}
 
     try:
+        garantir_banco()
         conn = sqlite3.connect("radar_clinico.db")
         cursor = conn.cursor()
         cursor.execute("SELECT role FROM usuarios WHERE LOWER(username) = ? AND password = ?", (u, p))
@@ -590,6 +781,7 @@ def login(data: LoginData):
 @app.post("/api/usuarios")
 def criar_usuario(data: NovoUsuario):
     try:
+        garantir_banco()
         conn = sqlite3.connect("radar_clinico.db")
         cursor = conn.cursor()
         cursor.execute("INSERT OR REPLACE INTO usuarios (username, password, role) VALUES (?, ?, ?)", (data.username.strip(), data.password.strip(), data.role))
@@ -601,6 +793,7 @@ def criar_usuario(data: NovoUsuario):
 
 @app.get("/api/antimicrobianos")
 def get_antimicrobianos():
+    garantir_banco()
     conn = sqlite3.connect("radar_clinico.db")
     cursor = conn.cursor()
     cursor.execute("SELECT id, nome_generico, nomes_comerciais FROM antimicrobianos ORDER BY nome_generico ASC")
@@ -615,6 +808,7 @@ def get_antimicrobianos():
 
 @app.post("/api/extrair-pdf")
 async def processar_pdf(file: Optional[UploadFile] = File(None), texto: Optional[str] = Form(None)):
+    garantir_banco()
     texto_bruto = ""
     if file:
         reader = pypdf.PdfReader(file.file)
@@ -630,7 +824,8 @@ async def processar_pdf(file: Optional[UploadFile] = File(None), texto: Optional
         
     texto_anon = limpar_texto_prescricao(texto_bruto)
     
-    linhas_originais = [l.strip() for l in texto_anon.splitlines() if l.string if l.strip()]
+    # ERRO CORRIGIDO AQUI: l.strip() em vez de l.string
+    linhas_originais = [l.strip() for l in texto_anon.splitlines() if l.strip()]
     palavras_negacao = ["suspender", "suspenso", "suspensa", "alergia", "alergico", "nao administrar"]
     linhas_validas = []
     for linha in linhas_originais:
@@ -758,6 +953,7 @@ def extrair_mg_da_posologia(posologia: str) -> float:
 
 @app.post("/api/avaliar")
 def avaliar_paciente(payload: AvaliacaoPayload):
+    garantir_banco()
     metricas = calcular_metricas(payload.sexo, payload.idade, payload.peso, payload.altura, payload.creatinina)
     clcr = metricas["clcr"]
     texto_bruto_norm = sem_acentos(payload.texto_prescricao_bruto.lower())
@@ -918,5 +1114,15 @@ def avaliar_paciente(payload: AvaliacaoPayload):
 
     return {"metricas": metricas, "soap": "\n".join(soap), "alertas_count": alertas_count}
 
+@app.get("/setup-manual")
+def setup_manual():
+    try:
+        import setup_db
+        setup_db.setup_database()
+        return {"mensagem": "Base de dados recriada com sucesso com 35 antimicrobianos e credenciais Noberto / admin123!"}
+    except Exception as e:
+        return {"erro": str(e)}
+
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    threading.Timer(1.5, lambda: webbrowser.open("http://127.0.0.1:8000")).start()
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, log_level="warning")
