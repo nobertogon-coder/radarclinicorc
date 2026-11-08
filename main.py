@@ -331,13 +331,12 @@ HTML_TEMPLATE = """
   </div>
 </div>
 
-<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/select2@4.1.0-rc.0/dist/js/select2.min.js"></script>
-<script>
-$(document).ready(function() {
-    $('#comorbidadesSelect').select2({ placeholder: "Selecione ou digite...", allowClear: true, width: '100%' });
-});
+window.onload = function() {
+    document.getElementById('login-view').classList.add('d-none');
+    document.getElementById('app-view').classList.remove('d-none');
+    document.getElementById('btnAdmin').classList.remove('d-none');
+    carregarCatalogo();
+};
 
 function addComorbidade(tag) {
     let select = $('#comorbidadesSelect');
