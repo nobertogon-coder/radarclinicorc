@@ -688,7 +688,7 @@ async function gerarAnalise() {
         }
     });
     
-    const textoBrutoTotal = document.getElementById("textoBrutoOculto").value + "\n" + document.getElementById("textoManual").value;
+    const textoBrutoTotal = document.getElementById("textoBrutoOculto").value + "\\n" + document.getElementById("textoManual").value;
 
     const payload = {
         sexo: document.getElementById("sexo").value,
@@ -824,7 +824,6 @@ async def processar_pdf(file: Optional[UploadFile] = File(None), texto: Optional
         
     texto_anon = limpar_texto_prescricao(texto_bruto)
     
-    # ERRO CORRIGIDO AQUI: l.strip() em vez de l.string
     linhas_originais = [l.strip() for l in texto_anon.splitlines() if l.strip()]
     palavras_negacao = ["suspender", "suspenso", "suspensa", "alergia", "alergico", "nao administrar"]
     linhas_validas = []
@@ -1124,5 +1123,4 @@ def setup_manual():
         return {"erro": str(e)}
 
 if __name__ == "__main__":
-    threading.Timer(1.5, lambda: webbrowser.open("http://127.0.0.1:8000")).start()
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, log_level="warning")
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
